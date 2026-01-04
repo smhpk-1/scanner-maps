@@ -92,6 +92,18 @@ def parse_args():
         help="Path to SQLite database file"
     )
     
+    parser.add_argument(
+        "--high-value",
+        action="store_true",
+        help="Also scan high-value file types (.bash_history, AndroidManifest, .ipynb, etc.)"
+    )
+    
+    parser.add_argument(
+        "--high-value-only",
+        action="store_true",
+        help="Only scan high-value file types (skip keyword/language search)"
+    )
+    
     return parser.parse_args()
 
 
@@ -203,18 +215,35 @@ def main():
             db.close()
             sys.exit(1)
         
-        # Perform search
-        results = scanner.search(
-            keywords=args.keywords,
-            languages=args.languages,
-            from_iter=args.from_iter,
-            max_pages=args.max_pages
-        )
+        results = []
+        new_keys = 0
         
-        console.print(f"\n[bold]Found {len(results)} potential API keys[/bold]\n")
+        # Perform standard keyword/language search
+        if not args.high_value_only:
+            console.print("\n[bold cyan]Phase 1: Keyword-based search[/bold cyan]")
+            keyword_results = scanner.search(
+                keywords=args.keywords,
+                languages=args.languages,
+                from_iter=args.from_iter,
+                max_pages=args.max_pages
+            )
+            results.extend(keyword_results)
+            console.print(f"[green]Found {len(keyword_results)} keys from keyword search[/green]")
+        
+        # Perform high-value path-based search
+        if args.high_value or args.high_value_only:
+            console.print("\n[bold cyan]Phase 2: High-value file type search[/bold cyan]")
+            console.print("[dim]Scanning: .bash_history, AndroidManifest.xml, .ipynb, next.config.js, etc.[/dim]\n")
+            path_results = scanner.search_by_path(
+                from_iter=args.from_iter if args.high_value_only else 0,
+                max_pages=args.max_pages
+            )
+            results.extend(path_results)
+            console.print(f"[green]Found {len(path_results)} keys from high-value files[/green]")
+        
+        console.print(f"\n[bold]Total: Found {len(results)} potential API keys[/bold]\n")
         
         # Add keys to database
-        new_keys = 0
         for api_key, source_url, file_path, language in results:
             if db.add_key(api_key, source_url, file_path, language):
                 new_keys += 1

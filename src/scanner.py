@@ -34,7 +34,7 @@ class GitHubScanner:
         r'(?:api_key|apikey|key|google_api_key|maps_api_key|places_api_key)\s*[=:]\s*["\']?(AIza[0-9A-Za-z\-_]{35})["\']?',
     ]
 
-    # Default search keywords
+    # Default search keywords - Standard patterns
     DEFAULT_KEYWORDS = [
         "GOOGLE_PLACES_API_KEY",
         "GOOGLE_MAPS_API_KEY",
@@ -44,6 +44,41 @@ class GitHubScanner:
         "places_api_key AIza",
         "googleapis.com/maps AIza",
         "maps.googleapis.com key=AIza",
+        "AIzaSy places",
+        "AIzaSy maps api",
+        "AIzaSy geocode",
+        "AIzaSy .env",
+        "AIzaSy config",
+    ]
+
+    # High-value file path patterns - these find keys in specific file types
+    # Use with search_by_path() method
+    HIGH_VALUE_PATHS = [
+        # Shell history files (leaked exports)
+        "path:**/.bash_history",
+        "path:**/.zsh_history",
+        # Environment files
+        "path:**/.env",
+        "path:**/.env.local",
+        "path:**/.env.production",
+        "path:**/.env.staging",
+        # Mobile app configs
+        "path:**/AndroidManifest.xml",
+        "path:**/Info.plist",
+        "path:**/app.json",  # Expo/React Native
+        "path:**/google-services.json",  # Firebase Android
+        "path:**/GoogleService-Info.plist",  # Firebase iOS
+        # Framework configs
+        "path:**/next.config.js",
+        "path:**/next.config.mjs",
+        "path:**/nuxt.config.js",
+        "path:**/gatsby-config.js",
+        # Data science
+        "path:**/*.ipynb",  # Jupyter Notebooks
+        # Build/CI configs
+        "path:**/.travis.yml",
+        "path:**/docker-compose.yml",
+        "path:**/Dockerfile",
     ]
 
     # Programming languages to search
@@ -199,6 +234,159 @@ class GitHubScanner:
                     except Exception as e:
                         console.print(f"[red]Error during search: {e}[/red]")
                         time.sleep(5)
+        
+        return results
+
+    def search_by_path(
+        self,
+        path_patterns: List[str] = None,
+        from_iter: int = 0,
+        max_pages: int = 3
+    ) -> List[Tuple[str, str, str, str]]:
+        """
+        Search GitHub for API keys in specific file types using path patterns.
+        
+        This is more effective for finding keys in config files, shell history,
+        mobile manifests, and other high-value targets.
+        
+        Args:
+            path_patterns: File path patterns to search (uses HIGH_VALUE_PATHS if None)
+            from_iter: Start from specific iteration
+            max_pages: Maximum pages to scan per path pattern
+            
+        Returns:
+            List of tuples: (api_key, source_url, file_path, file_type)
+        """
+        if not self.logged_in:
+            console.print("[bold red]Not logged in. Please call start() first.[/bold red]")
+            return []
+        
+        path_patterns = path_patterns or self.HIGH_VALUE_PATHS
+        
+        results = []
+        iteration = 0
+        
+        total_iterations = len(path_patterns) * max_pages
+        console.print(f"[bold]Scanning {len(path_patterns)} high-value file patterns[/bold]")
+        console.print(f"[bold]Total iterations: {total_iterations}[/bold]\n")
+        
+        for path_pattern in path_patterns:
+            for page in range(1, max_pages + 1):
+                iteration += 1
+                
+                if iteration < from_iter:
+                    continue
+                
+                # Extract file type from pattern for display
+                file_type = path_pattern.split("/")[-1].replace("*", "")
+                
+                console.print(
+                    f"[cyan]Iteration {iteration}/{total_iterations}[/cyan] - "
+                    f"Pattern: '{file_type}', Page: {page}"
+                )
+                
+                try:
+                    page_results = self._search_path_page(path_pattern, page)
+                    results.extend(page_results)
+                    
+                    if len(page_results) == 0:
+                        if self.debug:
+                            console.print("[dim]No results on this page, moving to next pattern[/dim]")
+                        break
+                    
+                    # Rate limiting
+                    time.sleep(3)
+                    
+                except Exception as e:
+                    console.print(f"[red]Error during path search: {e}[/red]")
+                    time.sleep(5)
+        
+        return results
+
+    def _search_path_page(
+        self,
+        path_pattern: str,
+        page: int
+    ) -> List[Tuple[str, str, str, str]]:
+        """
+        Search a single page of GitHub results for a specific path pattern.
+        
+        Returns:
+            List of tuples: (api_key, source_url, file_path, file_type)
+        """
+        results = []
+        
+        # Build search URL with path qualifier
+        encoded_pattern = quote_plus(f"AIzaSy {path_pattern}")
+        search_url = f"https://github.com/search?q={encoded_pattern}&type=code&p={page}"
+        
+        if self.debug:
+            console.print(f"[dim]Navigating to: {search_url}[/dim]")
+        
+        self.driver.get(search_url)
+        
+        # Wait for results to load
+        try:
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='results-list']"))
+            )
+        except TimeoutException:
+            if self.debug:
+                console.print("[dim]Timeout waiting for results[/dim]")
+            return []
+        
+        time.sleep(2)
+        
+        # Extract file type from pattern
+        file_type = path_pattern.split("/")[-1].replace("*", "")
+        
+        # Get page source and extract keys
+        page_source = self.driver.page_source
+        
+        for pattern in self.API_KEY_PATTERNS:
+            matches = re.findall(pattern, page_source, re.IGNORECASE)
+            for match in matches:
+                key = match.strip("'\"")
+                if re.match(r'^AIza[0-9A-Za-z\-_]{35}$', key):
+                    if key not in self.found_keys:
+                        self.found_keys.add(key)
+                        results.append((key, search_url, path_pattern, file_type))
+                        console.print(
+                            f"[bold green]Found key in {file_type}: "
+                            f"{key[:20]}...[/bold green]"
+                        )
+        
+        # Try to get more specific file paths from result items
+        try:
+            result_items = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "[data-testid='results-list'] > div"
+            )
+            
+            for item in result_items:
+                try:
+                    file_link = item.find_element(By.CSS_SELECTOR, "a[href*='/blob/']")
+                    file_url = file_link.get_attribute("href")
+                    file_path = file_link.text
+                    code_text = item.text
+                    
+                    for pattern in self.API_KEY_PATTERNS:
+                        matches = re.findall(pattern, code_text, re.IGNORECASE)
+                        for match in matches:
+                            key = match.strip("'\"")
+                            if re.match(r'^AIza[0-9A-Za-z\-_]{35}$', key):
+                                if key not in self.found_keys:
+                                    self.found_keys.add(key)
+                                    results.append((key, file_url, file_path, file_type))
+                                    console.print(
+                                        f"[bold green]Found key: {key[:20]}... "
+                                        f"in {file_path}[/bold green]"
+                                    )
+                except NoSuchElementException:
+                    continue
+        except Exception as e:
+            if self.debug:
+                console.print(f"[red]Error extracting path results: {e}[/red]")
         
         return results
 
